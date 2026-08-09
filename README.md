@@ -6,9 +6,9 @@ Windows-style minimize/restore toggle for the ML4W Quickshell dock on Hyprland.
 
 Click an app icon in the dock:
 
-- **Active app** → window minimizes (it moves to a special workspace). The pointer does **not** jump to the window center.
-- **Minimized app** → window restores to its **original workspace** and takes focus.
-- **Other app** → normal focus/cycle behavior.
+- **Active app** → window minimizes (it moves to a special workspace).
+- **Minimized app** → window restores to its **original workspace** and takes focus. The pointer does **not** jump to the window center.
+- **Other app** → normal focus/cycle behavior. The pointer does **not** jump to the window center.
 
 Verified on **Hyprland 0.56.2** (Lua config) with the ML4W Quickshell dock on CachyOS, 2026-08-09.
 

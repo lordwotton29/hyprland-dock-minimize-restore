@@ -1,4 +1,4 @@
-# hyprland-dock-toggle
+# hyprland-dock-minimize-restore
 
 > **For users of the [ML4W dotfiles](https://github.com/mylinuxforwork/dotfiles)** — this patch customizes the ML4W Quickshell dock on Hyprland. It is an independent community contribution, not part of the official ML4W repository.
 

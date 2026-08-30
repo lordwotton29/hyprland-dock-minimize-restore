@@ -71,7 +71,7 @@ Item {
         }
         const focused = ToplevelManager.activeToplevel
         const addr = Hyprland.activeToplevel ? Hyprland.activeToplevel.address : ""
-        // 0. L'app ha finestre minimizzate → ripristina ognuna nel suo workspace originale
+        // 0. L'app ha finestre minimizzate -> ripristina ognuna nel suo workspace originale
         if (item.hiddenWindows.length > 0) {
             while (item.hiddenWindows.length > 0) {
                 const h = item.hiddenWindows.shift()
@@ -80,7 +80,7 @@ Item {
             }
             return
         }
-        // 1. Click su un'app attiva → minimizza (special workspace, sintassi Hyprland 0.56)
+        // 1. Click su un'app attiva -> minimizza (special workspace, sintassi Hyprland 0.56)
         if (focused && focused.appId === item.entry.appId) {
             if (addr !== "" && !item.hiddenWindows.some(h => h.addr === addr)) {
                 const ws = Hyprland.focusedWorkspace
@@ -89,7 +89,7 @@ Item {
             }
             return
         }
-        // 2. App con più finestre: cicla sulla successiva (come prima)
+        // 2. App con piu finestre: cicla sulla successiva (come prima)
         let index = -1
         for (let i = 0; i < item.windows.length; i++)
             if (item.windows[i] === focused)

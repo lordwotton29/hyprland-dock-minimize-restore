@@ -3,7 +3,7 @@ import Quickshell.Wayland
 import Quickshell.Hyprland
 import QtQuick
 import QtQuick.Effects
-import qs.CustomTheme
+import qs.DockApp
 
 // One app in the dock: its icon, a running/focused indicator, a tooltip with
 // the app name and a right-click menu to pin or unpin it.
@@ -17,7 +17,8 @@ Item {
     // The dock window. It owns the (single) context menu, which is drawn inside
     // its own surface — see DockMenu for why it is not a popup window.
     property var dockWindow: null
-    // Indirizzi delle finestre nascoste (toggle Windows, special workspace)
+    // Window addresses and original workspaces hidden by the toggle.
+    // This is intentionally per dock item; the dock groups all windows by app.
     property var hiddenWindows: []
 
     // Whether the open context menu belongs to this item.
@@ -62,38 +63,174 @@ Item {
             Quickshell.execDetached(["bash", "-c", item.entry.appId])
     }
 
-    // Focus the app: its only window, or — when it has several — the one after
-    // the currently focused one, so repeated clicks cycle through them.
+    // --- TOGGLE HELPERS ---
+    // The dock holds Wayland toplevels, which carry no window address. The
+    // Hyprland list carries the address, the workspace and the activation flag
+    // for the same windows, so it is the source of truth for the toggle.
+    function normalizeAddress(address): string {
+        return String(address || "").toLowerCase().replace(/^0x/, "")
+    }
+
+    function isSpecial(workspace): bool {
+        return !!workspace && String(workspace.name || "").indexOf("special:") === 0
+    }
+
+    function owns(window): bool {
+        for (let i = 0; i < item.windows.length; i++)
+            if (item.windows[i] === window)
+                return true
+        return false
+    }
+
+    function windowByAddress(address): var {
+        const wanted = item.normalizeAddress(address)
+        if (wanted === "")
+            return null
+        const toplevels = Hyprland.toplevels.values
+        for (let i = 0; i < toplevels.length; i++)
+            if (item.normalizeAddress(toplevels[i].address) === wanted)
+                return toplevels[i]
+        return null
+    }
+
+    // The app's focused window, decided from the app's own windows instead of
+    // comparing app ids: covering windows, grouped ids and case differences
+    // (Hyprland reports "Hermes" for a dock entry pinned as "hermes") all work.
+    // The window must belong to this dock item: the globally active window is
+    // never used on its own, or clicking an unfocused app would act on whatever
+    // window happens to have focus.
+    function activeWindow(): var {
+        const toplevels = Hyprland.toplevels.values
+        for (let i = 0; i < toplevels.length; i++) {
+            const toplevel = toplevels[i]
+            if (!toplevel.activated || item.isSpecial(toplevel.workspace))
+                continue
+            if (item.owns(toplevel.wayland))
+                return toplevel
+        }
+        const active = Hyprland.activeToplevel
+        item.log("no-active own=" + item.windows.length
+            + " activeAddr=0x" + item.normalizeAddress(active ? active.address : "")
+            + " activeMine=" + item.owns(active ? active.wayland : null))
+        return null
+    }
+
+    // A window of this app parked in a special workspace.
+    function parkedWindow(): var {
+        const toplevels = Hyprland.toplevels.values
+        for (let i = 0; i < toplevels.length; i++) {
+            const toplevel = toplevels[i]
+            if (!item.isSpecial(toplevel.workspace))
+                continue
+            if (item.owns(toplevel.wayland))
+                return toplevel
+        }
+        return null
+    }
+
+    // Escape values embedded in Hyprland's single-quoted Lua expressions.
+    function escapeLuaString(value: string): string {
+        return String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'")
+    }
+
+    // Both dispatches travel in one Lua chunk: two separate hyprctl processes
+    // can race and leave the window moved but not focused.
+    function restoreCommand(address, workspace): string {
+        const addr = item.normalizeAddress(address)
+        const target = item.escapeLuaString(workspace)
+        return "hl.dispatch(hl.dsp.window.move({ workspace = '" + target
+            + "', window = 'address:0x" + addr + "', follow = false })); "
+            + "hl.dispatch(hl.dsp.focus({ window = 'address:0x" + addr + "' }))"
+    }
+
+    function hideCommand(address): string {
+        return "hl.dispatch(hl.dsp.window.move({ workspace = 'special:minimized'"
+            + ", window = 'address:0x" + item.normalizeAddress(address)
+            + "', follow = false }))"
+    }
+
+    // Where a window without a recorded origin comes back to.
+    function homeWorkspace(window): string {
+        const monitor = window && window.monitor ? window.monitor : Hyprland.focusedMonitor
+        const workspace = monitor && monitor.activeWorkspace
+            ? monitor.activeWorkspace : Hyprland.focusedWorkspace
+        if (workspace && !item.isSpecial(workspace))
+            return String(workspace.id)
+        return "1"
+    }
+
+    function dispatch(command: string): void {
+        Quickshell.execDetached(["hyprctl", "eval", command])
+    }
+
+    function log(message: string): void {
+        console.log("[dock-toggle] " + item.appName + ": " + message)
+    }
+
+    // Focus the app, or toggle its focused window into/out of the special
+    // minimized workspace. Hyprland 0.56 uses the Lua dispatcher API.
     function activate(): void {
         if (!item.running) {
+            item.log("launch")
             item.launch()
             return
         }
-        const focused = ToplevelManager.activeToplevel
-        const addr = Hyprland.activeToplevel ? Hyprland.activeToplevel.address : ""
-        // 0. L'app ha finestre minimizzate -> ripristina ognuna nel suo workspace originale
+
+        // 1. Windows we hid earlier: bring every one of them back.
         if (item.hiddenWindows.length > 0) {
+            let restored = 0
             while (item.hiddenWindows.length > 0) {
-                const h = item.hiddenWindows.shift()
-                const wsSel = h.ws >= 0 ? String(h.ws) : "name:" + h.wsName
-                Quickshell.execDetached(["sh", "-c", "hyprctl dispatch \"hl.dsp.window.move({ workspace = '" + wsSel + "', window = 'address:0x" + h.addr + "', follow = false })\"; hyprctl dispatch \"hl.dsp.focus({ window = 'address:0x" + h.addr + "' })\""])
+                const hidden = item.hiddenWindows.shift()
+                if (!item.windowByAddress(hidden.addr))
+                    continue // closed while it was hidden
+                const workspace = hidden.ws !== undefined && hidden.ws >= 0
+                    ? String(hidden.ws) : "name:" + hidden.wsName
+                item.dispatch(item.restoreCommand(hidden.addr, workspace))
+                restored++
             }
+            item.log("restore count=" + restored)
             return
         }
-        // 1. Click su un'app attiva -> minimizza (special workspace, sintassi Hyprland 0.56)
-        if (focused && focused.appId === item.entry.appId) {
-            if (addr !== "" && !item.hiddenWindows.some(h => h.addr === addr)) {
-                const ws = Hyprland.focusedWorkspace
-                item.hiddenWindows.push({ addr: addr, ws: ws ? ws.id : 1, wsName: ws ? ws.name : "" })
-                Quickshell.execDetached(["hyprctl", "dispatch", "hl.dsp.window.move({ workspace = 'special:minimized', window = 'address:0x" + addr + "', follow = false })"])
-            }
+
+        // 2. One of this app's windows is focused: minimize it.
+        const active = item.activeWindow()
+        if (active) {
+            const workspace = active.workspace
+            item.hiddenWindows.push({
+                addr: item.normalizeAddress(active.address),
+                ws: workspace ? workspace.id : 1,
+                wsName: workspace ? workspace.name : ""
+            })
+            item.dispatch(item.hideCommand(active.address))
+            item.log("minimize addr=0x" + item.normalizeAddress(active.address)
+                + " ws=" + (workspace ? workspace.name : "?"))
             return
         }
-        // 2. App con piu finestre: cicla sulla successiva (come prima)
+
+        // 3. A window of this app sits in a special workspace with no record —
+        //    the dock restarted while it was minimized.
+        const parked = item.parkedWindow()
+        if (parked) {
+            const workspace = item.homeWorkspace(parked)
+            item.dispatch(item.restoreCommand(parked.address, workspace))
+            item.log("restore unrecorded addr=0x"
+                + item.normalizeAddress(parked.address) + " ws=" + workspace)
+            return
+        }
+
+        // 4. Otherwise retain the upstream behavior: focus the only window or
+        // cycle through multiple windows of the selected application.
+        const focused = ToplevelManager.activeToplevel
+        if (item.windows.length === 1) {
+            item.log("focus single")
+            item.windows[0].activate()
+            return
+        }
         let index = -1
         for (let i = 0; i < item.windows.length; i++)
             if (item.windows[i] === focused)
                 index = i
+        item.log("focus next index=" + index)
         item.windows[(index + 1) % item.windows.length].activate()
     }
 
@@ -130,7 +267,7 @@ Item {
         width: item.iconSize + 14
         height: item.iconSize + 14
         radius: width / 2
-        color: item.highlighted ? Theme.primary : "transparent"
+        color: item.highlighted ? DockTheme.primary : "transparent"
         opacity: item.highlighted ? 0.25 : 0
 
         Behavior on color {
@@ -144,8 +281,10 @@ Item {
     Image {
         id: iconImage
         anchors.horizontalCenter: parent.horizontalCenter
-        anchors.top: parent.top
-        anchors.topMargin: 4
+        anchors.verticalCenter: parent.verticalCenter
+        // Like nwg-dock, the icon sits a touch above the true centre so the
+        // running indicator below it does not feel cramped.
+        anchors.verticalCenterOffset: -2
         source: item.iconSource
         width: item.iconSize
         height: item.iconSize
@@ -166,16 +305,17 @@ Item {
 
     // --- RUNNING INDICATOR ---
     // A dot below the icon for a running app; it widens into a short bar while
-    // one of its windows has focus.
+    // one of its windows has focus. The icon stays centred in the dock, so the
+    // indicator sits in the small gap left below it.
     Rectangle {
         id: indicator
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.bottom: parent.bottom
-        anchors.bottomMargin: 3
+        anchors.bottomMargin: 0
         height: 4
         width: item.active ? 14 : 4
         radius: 2
-        color: Theme.primary
+        color: DockTheme.primary
         opacity: item.running ? 1 : 0
 
         Behavior on width {
@@ -249,9 +389,9 @@ Item {
             implicitWidth: tooltipText.implicitWidth + 20
             implicitHeight: tooltipText.implicitHeight + 12
             radius: 8
-            color: Theme.surface_container_high
+            color: DockTheme.surface_container_high
             border.width: 1
-            border.color: Theme.outline_variant
+            border.color: DockTheme.outline_variant
 
             Text {
                 id: tooltipText
@@ -259,8 +399,8 @@ Item {
                 text: item.windows.length > 1
                     ? item.appName + " (" + item.windows.length + ")"
                     : item.appName
-                color: Theme.on_surface
-                font.family: Theme.fontFamily
+                color: DockTheme.on_surface
+                font.family: DockTheme.fontFamily
                 font.pixelSize: 14
             }
         }

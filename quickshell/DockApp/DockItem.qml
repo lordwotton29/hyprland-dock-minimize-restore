@@ -1,6 +1,7 @@
 import Quickshell
 import Quickshell.Wayland
 import Quickshell.Hyprland
+import Quickshell.Io
 import QtQuick
 import QtQuick.Effects
 import qs.DockApp
@@ -167,6 +168,143 @@ Item {
         console.log("[dock-toggle] " + item.appName + ": " + message)
     }
 
+    // --- LAYOUT POSITION ---
+    // Hyprland re-inserts a window at the end of its workspace layout, so a
+    // restored window loses its slot (left/right among its neighbours). The
+    // geometry a window had before hiding is remembered from the compositor's
+    // client list (the dock's Wayland toplevels carry no geometry) and the
+    // window is swapped back into place afterwards.
+    property var pendingHide: null
+    property var pendingRestore: null
+    property int restoreRounds: 0
+
+    function queryClients(): void {
+        clientsQuery.running = true
+    }
+
+    function findClient(list, address): var {
+        const wanted = item.normalizeAddress(address)
+        for (let i = 0; i < list.length; i++)
+            if (item.normalizeAddress(list[i].address) === wanted)
+                return list[i]
+        return null
+    }
+
+    function onClients(list): void {
+        if (item.pendingHide) {
+            const record = item.pendingHide
+            item.pendingHide = null
+            const client = item.findClient(list, record.addr)
+            if (client) {
+                record.x = client.at[0]
+                record.y = client.at[1]
+                record.w = client.size[0]
+                record.h = client.size[1]
+                record.monitor = client.monitor
+            }
+            item.hiddenWindows.push(record)
+            item.dispatch(item.hideCommand(record.addr))
+            item.log("minimize addr=0x" + record.addr + " ws=" + record.ws
+                + " slot=" + record.x + "," + record.y
+                + " size=" + record.w + "x" + record.h)
+            return
+        }
+        if (item.pendingRestore)
+            item.reorder(list)
+    }
+
+    // Swap the restored window back into the slot it had before, in small
+    // verified steps. Skipped when the window's size or monitor changed: the
+    // layout is not the one the position was recorded from.
+    function reorder(list): void {
+        const record = item.pendingRestore
+        const client = item.findClient(list, record.addr)
+        if (!client) {
+            item.pendingRestore = null
+            return
+        }
+        const sameSlot = record.w !== undefined
+            && client.size[0] === record.w && client.size[1] === record.h
+            && client.monitor === record.monitor
+        const dx = sameSlot ? client.at[0] - record.x : 0
+        const dy = sameSlot ? client.at[1] - record.y : 0
+        if (dx === 0 && dy === 0) {
+            item.pendingRestore = null
+            item.log("reorder ok addr=0x" + record.addr
+                + " slot=" + client.at[0] + "," + client.at[1])
+            return
+        }
+        if (item.restoreRounds >= 3) {
+            item.pendingRestore = null
+            item.log("reorder stopped addr=0x" + record.addr
+                + " slot=" + client.at[0] + "," + client.at[1])
+            return
+        }
+        item.restoreRounds += 1
+        const stepX = dx > 0 ? "left" : "right"
+        const stepY = dy > 0 ? "up" : "down"
+        const countX = Math.min(Math.round(Math.abs(dx) / Math.max(1, record.w)), 4)
+        const countY = Math.min(Math.round(Math.abs(dy) / Math.max(1, record.h)), 4)
+        if (countX === 0 && countY === 0) {
+            item.pendingRestore = null
+            item.log("reorder skipped addr=0x" + record.addr
+                + " size=" + client.size[0] + "x" + client.size[1])
+            return
+        }
+        let chunk = item.focusCommand(record.addr)
+        for (let i = 0; i < countX; i++)
+            chunk += "; " + item.swapCommand(stepX)
+        for (let i = 0; i < countY; i++)
+            chunk += "; " + item.swapCommand(stepY)
+        item.dispatch(chunk)
+        item.log("reorder addr=0x" + record.addr + " " + countX + "x" + stepX
+            + " " + countY + "x" + stepY)
+        restoreSettle.start()
+    }
+
+    function focusCommand(address): string {
+        return "hl.dispatch(hl.dsp.focus({ window = 'address:0x"
+            + item.normalizeAddress(address) + "' }))"
+    }
+
+    function swapCommand(direction): string {
+        return "hl.dispatch(hl.dsp.window.swap({ direction = '"
+            + direction + "' }))"
+    }
+
+    function queueReorder(record): void {
+        if (record.w === undefined)
+            return
+        item.pendingRestore = record
+        item.restoreRounds = 0
+        restoreSettle.start()
+    }
+
+    Process {
+        id: clientsQuery
+        command: ["hyprctl", "-j", "clients"]
+        stdout: StdioCollector {
+            id: clientsOutput
+            waitForEnd: true
+        }
+        onExited: {
+            let list = []
+            try {
+                list = JSON.parse(clientsOutput.text)
+            } catch (error) {
+                list = []
+            }
+            item.onClients(list)
+        }
+    }
+
+    Timer {
+        id: restoreSettle
+        interval: 150
+        repeat: false
+        onTriggered: item.queryClients()
+    }
+
     // Focus the app, or toggle its focused window into/out of the special
     // minimized workspace. Hyprland 0.56 uses the Lua dispatcher API.
     function activate(): void {
@@ -176,9 +314,11 @@ Item {
             return
         }
 
-        // 1. Windows we hid earlier: bring every one of them back.
+        // 1. Windows we hid earlier: bring every one of them back, then put the
+        //    first one back into the slot it had in the layout.
         if (item.hiddenWindows.length > 0) {
             let restored = 0
+            let firstSlot = null
             while (item.hiddenWindows.length > 0) {
                 const hidden = item.hiddenWindows.shift()
                 if (!item.windowByAddress(hidden.addr))
@@ -186,24 +326,27 @@ Item {
                 const workspace = hidden.ws !== undefined && hidden.ws >= 0
                     ? String(hidden.ws) : "name:" + hidden.wsName
                 item.dispatch(item.restoreCommand(hidden.addr, workspace))
+                if (firstSlot === null && hidden.w !== undefined)
+                    firstSlot = hidden
                 restored++
             }
             item.log("restore count=" + restored)
+            if (firstSlot)
+                item.queueReorder(firstSlot)
             return
         }
 
-        // 2. One of this app's windows is focused: minimize it.
+        // 2. One of this app's windows is focused: hide it. The slot is read
+        //    from the compositor first, so it can be restored afterwards.
         const active = item.activeWindow()
         if (active) {
             const workspace = active.workspace
-            item.hiddenWindows.push({
+            item.pendingHide = {
                 addr: item.normalizeAddress(active.address),
                 ws: workspace ? workspace.id : 1,
                 wsName: workspace ? workspace.name : ""
-            })
-            item.dispatch(item.hideCommand(active.address))
-            item.log("minimize addr=0x" + item.normalizeAddress(active.address)
-                + " ws=" + (workspace ? workspace.name : "?"))
+            }
+            item.queryClients()
             return
         }
 
